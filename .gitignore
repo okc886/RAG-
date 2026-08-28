@@ -75,3 +75,9 @@ start-all.bat
 replace_grid.js
 replace.js
 /面试问答手册.md
+
+# ===== local runtime data (do not commit) =====
+.ua/
+models/
+mysql_data/
+volumes/

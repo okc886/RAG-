@@ -1,4 +1,4 @@
-version: '3.5'
+  version: '3.5'
 
 services:
   # 1. 业务数据库 (MySQL 8.0)

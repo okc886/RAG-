@@ -1,0 +1,3 @@
+# Milvus standalone user config placeholder.
+# Keeping this file empty allows the standalone Milvus instance to start
+# with its default embedded user management settings.

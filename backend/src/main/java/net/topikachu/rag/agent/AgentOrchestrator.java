@@ -20,7 +20,7 @@ import reactor.core.scheduler.Scheduler;
 
 import java.time.Duration;
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
+import  java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
@@ -28,29 +28,58 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
+/**
+ * Agent编排器，RAG智能代理核心调度类
+ * 负责Agent多轮工具调用循环：规划 -> 知识库检索 -> 证据筛选 -> 生成回答/生成追问选项
+ * 控制最大执行步数、证据数量、重复查询次数，处理证据不足追问、拒答、幻觉防护逻辑
+ */
 @Component
 @Slf4j
 public class AgentOrchestrator {
 
+    /**
+     * 证据不足时，给到前端的固定提示文案
+     */
     private static final String FOLLOWUP_PROMPT = "现有证据不足，请选择一个更具体的问题继续检索。";
 
     private final ReactiveChatGateway reactiveChatGateway;
     private final AgentKnowledgeService knowledgeService;
     private final AgentToolBridge agentToolBridge;
     private final AgentHistorySnapshotBuilder historySnapshotBuilder;
+    /**
+     * Agent业务执行专用调度器，隔离Netty事件循环，执行阻塞工具逻辑
+     */
     private final Scheduler agentOrchestratorScheduler;
+    /**
+     * 链路追踪组件，埋点记录agent调用指标
+     */
     private final TracingSupport tracingSupport;
+    /**
+     * SpringAI工具调用增强Advisor，用于模型function call工具调用
+     */
     private final ToolCallAdvisor toolCallAdvisor = ToolCallAdvisor.builder().build();
 
+    /**
+     * Agent整体执行超时时间，单位毫秒
+     */
     @Value("${rag.agent.timeout-ms:12000}")
     private long timeoutMs;
 
+    /**
+     * Agent最大工具调用轮次，防止无限循环调用工具
+     */
     @Value("${rag.agent.max-steps:6}")
     private int maxToolCalls;
 
+    /**
+     * 单次Agent最多收集证据片段数量上限
+     */
     @Value("${rag.agent.max-evidence-count:12}")
     private int maxEvidenceCount;
 
+    /**
+     * 允许重复检索相同query最大次数，避免循环重复查询
+     */
     @Value("${rag.agent.max-repeated-query-count:2}")
     private int maxRepeatedQueryCount;
 
@@ -68,15 +97,29 @@ public class AgentOrchestrator {
         this.tracingSupport = tracingSupport;
     }
 
+    /**
+     * Agent主入口编排方法
+     * @param strategy 模型策略，区分不同大模型实例
+     * @param userInput 用户原始提问
+     * @param conversationId 会话id
+     * @param msgId 当前消息id
+     * @param currentUserContext 当前登录用户上下文
+     * @param searchScope 检索范围：选定标签、选定知识空间spaceCode
+     * @return Mono<AgentExecutionResult> Agent执行结果，包含证据、笔记时间线、追问选项、回答草稿、指令
+     */
     public Mono<AgentExecutionResult> orchestrate(ChatModelStrategy strategy,
                                                   String userInput,
                                                   String conversationId,
                                                   String msgId,
                                                   CurrentUserContext currentUserContext,
                                                   SearchScope searchScope) {
+        // 生成本次agent请求唯一id，用于日志、链路追踪
         String requestId = UUID.randomUUID().toString();
+        // 获取用户预选标签
         List<String> selectedTags = searchScope == null ? List.of() : searchScope.requestedTags();
+        // 获取用户预选知识空间
         List<String> selectedSpaces = searchScope == null ? List.of() : searchScope.requestedSpaceCodes();
+        // Agent执行上下文：保存本轮全部可变状态：检索证据、笔记、步骤、追问候选等
         AgentExecutionContext executionContext = new AgentExecutionContext(
                 requestId,
                 conversationId,
@@ -84,10 +127,10 @@ public class AgentOrchestrator {
                 userInput,
                 selectedTags,
                 selectedSpaces);
-        // 必须在工具调用前写入 PLANNING 阶段 note：首次 invoke 会快照 notes 用于 UI 展示，提前写入避免空时间线
+        // 写入PLANNING规划阶段note，UI渲染时间线，提前写入避免前端时间线为空
         executionContext.addNote(AgentStage.PLANNING, "decision", "正在规划检索与回答步骤。");
 
-        // 集中注入所有依赖到可变状态容器：多个工具回调在一个 agent 循环内共享此对象，封装 step 级状态
+        // 工具回调对象：封装知识库检索、生成追问选项等工具，在多轮tool call之间共享executionContext状态
         AgentKnowledgeTools toolObject = new AgentKnowledgeTools(
                 knowledgeService,
                 executionContext,
@@ -100,13 +143,17 @@ public class AgentOrchestrator {
                 maxToolCalls,
                 maxEvidenceCount,
                 maxRepeatedQueryCount);
+        // 将工具对象包装为SpringAI工具回调列表，供模型调用
         List<ToolCallback> toolCallbacks = List.of(ToolCallbacks.from(toolObject));
+        // 拼接历史会话消息快照
         List<Message> messages = new ArrayList<>(historySnapshotBuilder.build(conversationId));
+        // 添加当前用户提问消息
         messages.add(UserMessage.builder().text(userInput).build());
 
+        // 构建Agent工具调用流水线：执行模型+工具循环，输出AgentResolution结构化JSON结果
         Mono<AgentExecutionResult> pipeline = reactiveChatGateway.runToolPhase(
                         strategy.getChatClient(),
-                        toolPhasePrompt(),
+                        toolPhasePrompt(), // Agent系统提示词
                         Map.of(
                                 "preselectedTags", summarizeValues(selectedTags),
                                 "preselectedSpaces", summarizeValues(selectedSpaces)),
@@ -115,12 +162,16 @@ public class AgentOrchestrator {
                         toolCallbacks,
                         toolContext(executionContext),
                         AgentResolution.class)
+                // 将模型输出的结构化解析结果转换为对外返回的Agent执行结果
                 .map(resolution -> toExecutionResult(executionContext, resolution))
-                // switchIfEmpty 而非 defaultIfEmpty：仅当模型未输出有效 JSON 时才惰性触发回落
+                // 模型没有输出有效JSON，触发回落逻辑，生成追问选项
                 .switchIfEmpty(Mono.fromSupplier(() -> noEvidenceFollowup(executionContext.snapshot())))
+                // 捕获Agent执行异常，打印错误日志
                 .doOnError(error -> log.error("Agent tool phase failed. conversationId={}, msgId={}", conversationId, msgId, error))
+                // 全部agent业务逻辑运行在agent专用调度器，不阻塞netty事件循环
                 .subscribeOn(agentOrchestratorScheduler);
 
+        // 链路追踪包装，记录agent执行埋点指标
         return tracingSupport.traceMono("agent.orchestrate",
                 Map.of(
                         "chat.mode", "agent",
@@ -130,6 +181,15 @@ public class AgentOrchestrator {
                 pipeline);
     }
 
+    /**
+     * 重载方法：简化入参，直接传入标签列表，内部封装SearchScope调用主orchestrate
+     * @param strategy 模型策略
+     * @param userInput 用户提问
+     * @param conversationId 会话id
+     * @param msgId 消息id
+     * @param tags 限定检索标签
+     * @return Mono<AgentExecutionResult>
+     */
     public Mono<AgentExecutionResult> orchestrate(ChatModelStrategy strategy,
                                                   String userInput,
                                                   String conversationId,
@@ -138,15 +198,25 @@ public class AgentOrchestrator {
         return orchestrate(strategy, userInput, conversationId, msgId, null, new SearchScope(List.of(), tags));
     }
 
+    /**
+     * 将模型输出AgentResolution转换为对外输出AgentExecutionResult
+     * 分支处理：followup追问、refusal拒答、normal正常回答；增加幻觉防护：未选中证据强制走追问
+     * @param executionContext agent执行上下文
+     * @param resolution 模型输出结构化JSON解析对象
+     * @return AgentExecutionResult
+     */
     private AgentExecutionResult toExecutionResult(AgentExecutionContext executionContext, AgentResolution resolution) {
         AgentExecutionSnapshot snapshot = executionContext.snapshot();
         if (resolution == null) {
             return noEvidenceFollowup(snapshot);
         }
 
+        // 归一化模型输出type，防止LLM输出大小写混乱
         String type = normalizeType(resolution.type());
+        // 归一化answerMode，normal正常回答 / refusal拒答
         String answerMode = normalizeAnswerMode(resolution.answerMode());
 
+        // 分支1：type=followup，证据不足，返回追问按钮给前端
         if ("followup".equals(type)) {
             executionContext.addNote(AgentStage.FOLLOWUP, "decision", "当前证据不足，转为点击式追问。");
             snapshot = executionContext.snapshot();
@@ -163,6 +233,7 @@ public class AgentOrchestrator {
                     false);
         }
 
+        // 分支2：answerMode=refusal，知识库无法回答，拒答模式
         if ("refusal".equals(answerMode)) {
             executionContext.addNote(AgentStage.GENERATING_FINAL, "decision", "知识库无法回答该问题，返回拒答说明。");
             snapshot = executionContext.snapshot();
@@ -178,21 +249,25 @@ public class AgentOrchestrator {
                     false);
         }
 
+        // 根据模型选中的evidenceId，筛选最终要使用的证据片段
         List<EvidenceSnapshot> selectedEvidence = AgentEvidenceSelector.selectEvidence(
                 snapshot.retrievedEvidence(),
                 resolution.selectedEvidenceIds());
-        // 模型返回 answer 但未选中任何证据：防止模型在无证据支撑下产生幻觉回答，强制回退为追问
+        // 幻觉防护：模型要输出回答，但是没有选中任何证据，禁止回答，强制降级追问，防止大模型编造内容
         if (selectedEvidence.isEmpty()) {
             executionContext.addNote(AgentStage.FOLLOWUP, "decision", "模型未选中有效证据，回退为点击式追问。");
             return noEvidenceFollowup(executionContext.snapshot());
         }
+        // 根据选中证据，筛选对应的父级上下文块
         List<ParentContextBlock> selectedParentContexts =
                 AgentEvidenceSelector.selectParentContextsForEvidence(
                         snapshot.retrievedParentContexts(),
                         resolution.selectedEvidenceIds());
 
+        // 标记进入最终生成阶段
         executionContext.addNote(AgentStage.GENERATING_FINAL, "decision", "已完成证据选择，准备生成最终答案。");
         snapshot = executionContext.snapshot();
+        // 组装正常回答结果返回
         return new AgentExecutionResult(
                 List.copyOf(selectedEvidence),
                 selectedParentContexts,
@@ -205,6 +280,11 @@ public class AgentOrchestrator {
                 resolution.finalInstruction() != null && !resolution.finalInstruction().isBlank());
     }
 
+    /**
+     * 无证据回落：生成追问结果对象
+     * @param snapshot agent执行快照
+     * @return AgentExecutionResult
+     */
     private AgentExecutionResult noEvidenceFollowup(AgentExecutionSnapshot snapshot) {
         FollowupSuggestion suggestion = resolveFollowupSuggestion(snapshot);
         return new AgentExecutionResult(
@@ -219,15 +299,26 @@ public class AgentOrchestrator {
                 false);
     }
 
+    /**
+     * 解析追问候选：优先使用工具generateFollowupOptions产出的候选；不满足条件则走兜底生成逻辑
+     * @param snapshot agent快照
+     * @return FollowupSuggestion 追问提示+选项
+     */
     private FollowupSuggestion resolveFollowupSuggestion(AgentExecutionSnapshot snapshot) {
         FollowupOptionsResult candidate = snapshot.followupOptionsCandidate();
+        // 校验工具输出的追问候选是否合法：status=ok，恰好2个选项，UI只渲染两个按钮
         if (candidate != null && "ok".equals(candidate.status()) && isValidFollowupCandidate(candidate)) {
             return new FollowupSuggestion(FOLLOWUP_PROMPT, List.copyOf(candidate.options()), "tool");
         }
+        // 工具输出不合法，进入兜底逻辑，后端自己生成追问选项
         return buildFallbackSuggestion(snapshot.originalUserInput(), snapshot.retrievalGapType(), snapshot.allowedFocusTypes());
     }
 
-    // 要求恰好 2 个选项和 focusType：UI 只渲染两个追问按钮，多于 2 个溢出布局，少于 2 个用户无选择余地
+    /**
+     * 校验工具返回的追问候选是否符合UI约束：必须恰好2个选项、2个focusType
+     * @param candidate 工具返回追问候选
+     * @return true合法 false不合法
+     */
     private boolean isValidFollowupCandidate(FollowupOptionsResult candidate) {
         return candidate.options() != null
                 && candidate.focusTypes() != null
@@ -235,9 +326,16 @@ public class AgentOrchestrator {
                 && candidate.focusTypes().size() == 2;
     }
 
+    /**
+     * 兜底构建追问建议，当工具生成追问不满足条件时，后端根据缺口类型自己生成两道追问
+     * @param originalUserInput 用户原始输入
+     * @param gapType 检索缺口类型：时间缺失、范围缺失、主体模糊等
+     * @param allowedFocusTypes 允许聚焦类型
+     * @return FollowupSuggestion
+     */
     private FollowupSuggestion buildFallbackSuggestion(String originalUserInput,
-                                                      RetrievalGapType gapType,
-                                                      List<String> allowedFocusTypes) {
+                                                       RetrievalGapType gapType,
+                                                       List<String> allowedFocusTypes) {
         List<String> focusTypes = pickFallbackFocusTypes(gapType, allowedFocusTypes);
         List<String> options = focusTypes.stream()
                 .map(focusType -> buildFallbackQuestion(originalUserInput, focusType))
@@ -245,12 +343,18 @@ public class AgentOrchestrator {
         return new FollowupSuggestion(FOLLOWUP_PROMPT, options, "fallback");
     }
 
-    // 每种检索缺口类型映射到特定 focusType 组合：基于知识库覆盖分析和实证调优，非随机配对
+    /**
+     * 根据检索缺口类型，挑选两个聚焦维度(time/procedure/subject/scope)，用于生成兜底追问
+     * @param gapType 检索缺口类型
+     * @param allowedFocusTypes 允许的聚焦类型
+     * @return 2个focusType列表
+     */
     private List<String> pickFallbackFocusTypes(RetrievalGapType gapType, List<String> allowedFocusTypes) {
         Set<String> focusTypes = new LinkedHashSet<>();
         if (allowedFocusTypes != null) {
             focusTypes.addAll(allowedFocusTypes);
         }
+        // 如果可用聚焦类型不足2个，根据缺口类型补充固定组合
         if (focusTypes.size() < 2) {
             switch (gapType == null ? RetrievalGapType.MISSING_SCOPE : gapType) {
                 case MISSING_TIME -> {
@@ -272,12 +376,19 @@ public class AgentOrchestrator {
             }
         }
         List<String> selected = new ArrayList<>(focusTypes);
+        // 兜底保底，至少两个
         if (selected.size() < 2) {
             selected = List.of("scope", "procedure");
         }
         return selected.subList(0, 2);
     }
 
+    /**
+     * 根据focusType生成兜底追问文本
+     * @param originalUserInput 用户原始问题
+     * @param focusType 聚焦维度 time/procedure/subject/scope
+     * @return 生成的追问问句
+     */
     private String buildFallbackQuestion(String originalUserInput, String focusType) {
         String question = abbreviateQuestion(originalUserInput);
         return switch (focusType == null ? "scope" : focusType.toLowerCase(Locale.ROOT)) {
@@ -289,6 +400,11 @@ public class AgentOrchestrator {
         };
     }
 
+    /**
+     * 截断过长用户问题，用于追问展示，避免文案过长
+     * @param originalUserInput 原始输入
+     * @return 截断后简短文本
+     */
     private String abbreviateQuestion(String originalUserInput) {
         if (originalUserInput == null || originalUserInput.isBlank()) {
             return "当前问题";
@@ -297,12 +413,22 @@ public class AgentOrchestrator {
         return trimmed.length() > 90 ? trimmed.substring(0, 90) + "..." : trimmed;
     }
 
+    /**
+     * 将AgentNote按照sequence序列号排序，保证UI时间线顺序正确
+     * @param notes note列表
+     * @return 排序后note
+     */
     private List<AgentNote> sortNotes(List<AgentNote> notes) {
         return notes.stream()
                 .sorted((left, right) -> Long.compare(left.sequence(), right.sequence()))
                 .toList();
     }
 
+    /**
+     * 组装工具调用上下文map，传给SpringAI工具调用环境，工具内部可以读取这些参数
+     * @param executionContext agent执行上下文
+     * @return map上下文
+     */
     private Map<String, Object> toolContext(AgentExecutionContext executionContext) {
         Map<String, Object> context = new LinkedHashMap<>();
         context.put("requestId", executionContext.requestId());
@@ -313,6 +439,11 @@ public class AgentOrchestrator {
         return context;
     }
 
+    /**
+     * 将标签/spaceCode列表拼接为字符串，填充到prompt模板变量，给大模型阅读
+     * @param values 字符串列表
+     * @return 拼接后文本，空集合返回“无”
+     */
     private String summarizeValues(List<String> values) {
         if (values == null || values.isEmpty()) {
             return "无";
@@ -320,7 +451,11 @@ public class AgentOrchestrator {
         return String.join(", ", values);
     }
 
-    // 未知类型静默降级为最保守默认值：LLM 输出枚举可能不符合预期，降级而非抛异常保证用户体验不中断
+    /**
+     * 归一化模型输出type字段，容错LLM输出乱值，非法值降级为followup追问
+     * @param type 模型输出原始type
+     * @return answer / followup
+     */
     private String normalizeType(String type) {
         if (type == null) {
             return "followup";
@@ -332,7 +467,11 @@ public class AgentOrchestrator {
         return "followup";
     }
 
-    // 未知 answerMode 静默降级为 normal：LLM 可能输出非预期枚举值，降级保证回答流程不中断
+    /**
+     * 归一化answerMode，容错LLM输出乱值，非法值降级normal正常回答
+     * @param answerMode 模型原始输出
+     * @return normal / refusal
+     */
     private String normalizeAnswerMode(String answerMode) {
         if (answerMode == null) {
             return "normal";
@@ -344,18 +483,32 @@ public class AgentOrchestrator {
         return "normal";
     }
 
+    /**
+     * 拒答模式兜底草稿，模型没有输出draftAnswer时使用默认文案
+     * @param draftAnswer 模型输出草稿
+     * @return 拒答文本
+     */
     private String defaultRefusalDraft(String draftAnswer) {
         return (draftAnswer == null || draftAnswer.isBlank())
                 ? "当前知识库中没有足够证据支持回答该问题，因此不能给出确定结论。"
                 : draftAnswer;
     }
 
+    /**
+     * 拒答模式兜底finalInstruction，模型为空时填充默认指令
+     * @param finalInstruction 模型输出指令
+     * @return 收口指令文本
+     */
     private String defaultRefusalInstruction(String finalInstruction) {
         return (finalInstruction == null || finalInstruction.isBlank())
                 ? "明确说明只能依据当前知识库作答，当前证据不足，不能编造或外推。"
                 : finalInstruction;
     }
 
+    /**
+     * Agent工具调用阶段系统提示词
+     * 约束大模型：检索query规则、工具返回结果处理、输出严格JSON格式、字段约束、证据引用规则、权限空间约束
+     */
     private String toolPhasePrompt() {
         return """
                 你是校园知识库问答系统中的证据编排代理。

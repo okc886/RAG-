@@ -8,9 +8,9 @@ from typing import List, Dict, Union
 import unicodedata
 
 # ================= 配置区域 =================
-OV_MODEL_PATH = r"D:\soft\python\model\bge-m3-ov"
+OV_MODEL_PATH = r"C:\Users\lo\Desktop\spring-ai-rag-knowledgebase\models\bge-m3-ov"
 PORT = 8098
-DEVICE = "GPU" 
+DEVICE = "CPU"
 # ===========================================
 
 print(f"OpenVINO 服务已配置，设备: {DEVICE}")
